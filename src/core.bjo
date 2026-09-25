@@ -408,13 +408,11 @@
   (def texts
     (loop (:for p (sql-pieces s))
           (:with n 1 (match p ((Param _) (+ n 1)) (_ n)))
-          (:acc out (listing (text-of p n)))
-          => out))
+          (:acc (listing (text-of p n)))))
   (def params
     (loop (:for p (sql-pieces s))
           (:when-let (Param v) p)
-          (:acc out (vecing v))
-          => out))
+          (:acc (vecing v))))
   (Statement (text (string-join (list->vec texts) "")) (params params)))
 
 
@@ -528,8 +526,12 @@
 (: cond->sql (-> (-> %test Sql) (Cond %test) Sql))
 (defun (cond->sql leaf c)
   (match c
-    ((And cs) (if (empty? cs) (sql-raw "1 = 1") (paren (sql-join " AND " (list-map #(cond->sql leaf &) cs)))))
-    ((Or cs) (if (empty? cs) (sql-raw "1 = 0") (paren (sql-join " OR " (list-map #(cond->sql leaf &) cs)))))
+    ((And cs) (if (empty? cs)
+                  (sql-raw "1 = 1")
+                  (paren (sql-join " AND " (list-map #(cond->sql leaf &) cs)))))
+    ((Or cs) (if (empty? cs)
+                 (sql-raw "1 = 0")
+                 (paren (sql-join " OR " (list-map #(cond->sql leaf &) cs)))))
     ((Not inner) (sql-append (sql-raw "NOT ") (paren (cond->sql leaf inner))))
     ((RawCond s) (paren s))
     ((Leaf t) (leaf t))))
@@ -595,6 +597,7 @@
 (: select->sql (-> (Table %row %col %test %set) (Select %col %test) Sql))
 (defun (select->sql table q)
   (def (SelectQuery clauses) q)
+  ;; TODO cleanup
   (def col-name (record-ref table col-name))
   (def named (list-concat (loop (:for c clauses) (:when-let (Columns cs) c) (:acc out (listing cs)) => out)))
   (def distinct? (any? #(match & ((Distinct) #t) (_ #f)) clauses))
@@ -633,6 +636,7 @@
   (def test (record-ref table test))
   (match change
     ((UpdateQuery clauses)
+     ;; TODO: cleanup.
      (def sets (list-concat (loop (:for c clauses) (:when-let (SetTo ss) c) (:acc out (listing ss)) => out)))
      (def wheres (loop (:for c clauses) (:when-let (UpdateWhere w) c) (:acc out (listing w)) => out))
      (if (empty? sets)
@@ -656,8 +660,7 @@
   (def given
     (loop (:for c (table-columns table))
           (:for v ((record-ref table values) row))
-          (:acc out (listing (Tuple c v)) #:when (not (column-auto? c)))
-          => out))
+          (:acc (listing (Tuple c v)) #:when (not (column-auto? c)))))
   (sql-concat
     (list (sql-raw "INSERT INTO ")
           (sql-name (table-name table))
@@ -715,6 +718,7 @@
       ((same? (vec-ref names i)) (Some i))
       (else (index-where same? (+ i 1)))))
   (def lower (string-downcase column))
+  ;; TODO clean this up. 
   (match (match (index-where #(= & column) 0)
            ((Some i) (Some i))
            (None (index-where #(= (string-downcase &) lower) 0)))
