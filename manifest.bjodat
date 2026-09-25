@@ -1,0 +1,9 @@
+(package
+  (name (bjosql))
+  (version "0.1.0")
+  (description "SQL as data: a query grammar written once, tables that supply its words, values that travel as parameters.")
+  (license "MPL-2.0")
+
+  ;; A library: there is no src/main.bjo, so `bjo build` builds every module
+  ;; under src/. It talks to no database; a driver such as bjosqlite does.
+  )

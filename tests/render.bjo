@@ -1,0 +1,164 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosql/tests/render.bjo — what the statements render to. No database.
+;;
+;;     bjo run tests/render.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjosql core))
+
+(def/table users User
+  (id int #:primary-key #:auto)
+  (name string)
+  (email (Option string))
+  (age int))
+
+(def/table memberships Membership #:sql-name "user_groups"
+  (user int #:primary-key)
+  (group string #:primary-key)
+  (since string #:sql-type "TIMESTAMP"))
+
+;; `$1`, `$2`: the placeholders are numbered in the order the values appear.
+(: numbered Dialect)
+(def numbered (record-set standard-dialect (placeholder (fun (n) (str "$" (int->string n))))))
+
+(: show (-> Sql string))
+(defun (show s)
+  (def st (render numbered s))
+  (def params (vec->list (statement-params st)))
+  (if (empty? params)
+      (statement-text st)
+      (str (statement-text st) " | " (string-join (list->vec (list-map describe-sql-value params)) ", "))))
+
+(: show-select (-> UserSelect string))
+(defun (show-select q) (show (select->sql users q)))
+
+(: show-change (-> UserChange string))
+(defun (show-change c)
+  (match (change->sql users c)
+    ((Ok s) (show s))
+    ((Err e) (str "error: " (sql-error-message e)))))
+
+;; Fragments: a literal in a return position is read against the return type,
+;; through `if` too.
+(: named (-> string UserCond))
+(defun (named who) '(name (= ,who)))
+
+(: grown-ups (-> bool UserCond))
+(defun (grown-ups strict?)
+  (if strict? '(age (>= 21)) '(age (>= 18))))
+
+(: find-user (-> string UserSelect))
+(defun (find-user who)
+  '(select (id name) (where (and ,(named who) ,(grown-ups #t))) (limit 1)))
+
+(defun (main args)
+  (def (: n int) 3)
+
+  ;; --- select ---------------------------------------------------------------
+  (expect "every column, written out"
+          (show-select '(select))
+          "SELECT \"id\", \"name\", \"email\", \"age\" FROM \"users\"")
+  (expect "* is every column" (show-select '(select *)) (show-select '(select)))
+  (expect "a projection and a condition"
+          (show-select '(select (id name) (where (id (>= ,n)))))
+          "SELECT \"id\", \"name\" FROM \"users\" WHERE \"id\" >= $1 | the integer 3")
+  (expect "the logic"
+          (show-select '(select (id) (where (or (and (age (between 18 65)) (name (like "A%")))
+                                                (not (email is-null))))))
+          (str "SELECT \"id\" FROM \"users\" WHERE ((\"age\" BETWEEN $1 AND $2 AND \"name\" LIKE $3)"
+               " OR NOT (\"email\" IS NULL)) | the integer 18, the integer 65, the text \"A%\""))
+  (expect "a nullable column takes every test as well as the null ones"
+          (show-select '(select (id) (where (email (= "a@b.c")))))
+          "SELECT \"id\" FROM \"users\" WHERE \"email\" = $1 | the text \"a@b.c\"")
+  (expect "in"
+          (show-select '(select (id) (where (id (in 1 2 3)))))
+          "SELECT \"id\" FROM \"users\" WHERE \"id\" IN ($1, $2, $3) | the integer 1, the integer 2, the integer 3")
+  (expect "an empty in holds nothing"
+          (show-select '(select (id) (where (id (in)))))
+          "SELECT \"id\" FROM \"users\" WHERE 1 = 0")
+  (expect "several wheres are all of them"
+          (show-select '(select (id) (where (id (> 1))) (where (age (< 9)))))
+          "SELECT \"id\" FROM \"users\" WHERE (\"id\" > $1 AND \"age\" < $2) | the integer 1, the integer 9")
+  (expect "order, limit and offset, whatever order they are written in"
+          (show-select '(select (offset 20) (order-by name (desc id)) (limit 10) distinct (name)))
+          "SELECT DISTINCT \"name\" FROM \"users\" ORDER BY \"name\", \"id\" DESC LIMIT $1 OFFSET $2 | the integer 10, the integer 20")
+  (expect "an offset alone gets the dialect's limit that limits nothing"
+          (render (record-set numbered (no-limit " LIMIT -1")) (select->sql users '(select (id) (offset 5))))
+          (render numbered (sql "SELECT \"id\" FROM \"users\" LIMIT -1 OFFSET ?" (list (to-sql 5)))))
+  (expect "fragments, built by functions"
+          (show-select (find-user "ada"))
+          (str "SELECT \"id\", \"name\" FROM \"users\" WHERE (\"name\" = $1 AND \"age\" >= $2) LIMIT $3"
+               " | the text \"ada\", the integer 21, the integer 1"))
+  (expect "SQL by hand inside a condition"
+          (show-select '(select (id) (where (and (id (> 1)) ,(sql "length(name) > ?" (list (to-sql 2)))))))
+          "SELECT \"id\" FROM \"users\" WHERE (\"id\" > $1 AND (length(name) > $2)) | the integer 1, the integer 2")
+
+  ;; --- update and delete ------------------------------------------------------
+  (expect "update"
+          (show-change '(update (set (name "Ada") (email ,None)) (where (id (= 1)))))
+          "UPDATE \"users\" SET \"name\" = $1, \"email\" = $2 WHERE \"id\" = $3 | the text \"Ada\", NULL, the integer 1")
+  (expect "a nullable column is set from a value, null, or an Option"
+          (show-change '(update (set (email "a@b.c") (email null) (email ,(Some "x")))))
+          "UPDATE \"users\" SET \"email\" = $1, \"email\" = $2, \"email\" = $3 | the text \"a@b.c\", NULL, the text \"x\"")
+  (expect "an update with nothing to set is refused"
+          (show-change '(update (set) (where (id (= 1)))))
+          "error: an update of users needs a (set ...) with something in it.")
+  (expect "delete"
+          (show-change '(delete (where (age (< 18)))))
+          "DELETE FROM \"users\" WHERE \"age\" < $1 | the integer 18")
+  (expect "delete everything" (show-change '(delete)) "DELETE FROM \"users\"")
+
+  ;; --- insert and create --------------------------------------------------------
+  (expect "insert leaves out the #:auto column, and returns the row"
+          (show (insert->sql users (User (id 0) (name "Ada") (email None) (age 36))))
+          (str "INSERT INTO \"users\" (\"name\", \"email\", \"age\") VALUES ($1, $2, $3)"
+               " RETURNING \"id\", \"name\", \"email\", \"age\" | the text \"Ada\", NULL, the integer 36"))
+  (expect "create table"
+          (show (create-table->sql users))
+          (str "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, "
+               "\"name\" TEXT NOT NULL, \"email\" TEXT, \"age\" BIGINT NOT NULL)"))
+  (expect "a composite key, another SQL name and a type of one's own"
+          (show (create-table->sql memberships))
+          (str "CREATE TABLE IF NOT EXISTS \"user_groups\" (\"user\" BIGINT, \"group\" TEXT, "
+               "\"since\" TIMESTAMP NOT NULL, PRIMARY KEY (\"user\", \"group\"))"))
+
+  ;; --- sql by hand ----------------------------------------------------------------
+  (expect "a ? in a string is text"
+          (show (sql "SELECT '?' AS q, \"a?\" FROM t WHERE x = ?" (list (to-sql "y"))))
+          "SELECT '?' AS q, \"a?\" FROM t WHERE x = $1 | the text \"y\"")
+  (expect-true "too few values is the program's mistake"
+               (match (try (sql "SELECT ?" Nil) #:catch (System.ArgumentException))
+                 ((Err _) #t)
+                 ((Ok _) #f)))
+
+  ;; --- rows -----------------------------------------------------------------------
+  (def row (make-row ["id" "name" "email" "age"]
+                     [(SqlInt 7L) (SqlText "Ada") SqlNull (SqlInt 36L)]))
+  (expect "a row is decoded by column name"
+          (match (decode-row users row)
+            ((Ok u) (str (int->string (record-ref u id)) " " (record-ref u name) " " (->str (record-ref u email))))
+            ((Err e) (sql-error-message e)))
+          "7 Ada None")
+  (expect "a missing column is named"
+          (match (decode-row users (make-row ["id"] [(SqlInt 7L)]))
+            ((Ok _) "decoded")
+            ((Err e) (sql-error-message e)))
+          "the result has no column name.")
+  (expect "a value of the wrong kind is named"
+          (match (decode-row users (make-row ["id" "name" "email" "age"]
+                                             [(SqlText "seven") (SqlText "Ada") SqlNull (SqlInt 1L)]))
+            ((Ok _) "decoded")
+            ((Err e) (sql-error-message e)))
+          "column id: expected an integer, got the text \"seven\".")
+  (expect "names are compared ignoring case when nothing matches exactly"
+          (match (row-field (make-row ["COUNT"] [(SqlInt 2L)]) "count")
+            ((Ok n) (long->string n))
+            ((Err e) (sql-error-message e)))
+          "2")
+  0)

@@ -1,0 +1,177 @@
+* bjosql — SQL as data, for Bjolang
+
+A table is declared once. A query against it is a quoted literal that the type
+checker reads against the table's columns:
+
+#+BEGIN_SRC scheme
+(import (bjosql core))
+
+(def/table users User
+  (id int #:primary-key #:auto)
+  (name string)
+  (email (Option string))
+  (age int))
+
+(: grown-ups (-> int UserSelect))
+(defun (grown-ups n)
+  '(select (id name)
+           (where (and (age (>= ,n)) (email not-null)))
+           (order-by name (desc id))
+           (limit 10)))
+#+END_SRC
+
+~(name (= ,3))~ is a type error, because ~name~ is a string. ~(id is-null)~ is
+one too, because ~id~ is not an ~Option~. A misspelt column is reported with the
+columns that exist:
+
+#+BEGIN_SRC
+Type Error at app.bjo:9: `idd` is not a tag of the union app/UserColumn [...]. Its tags are id, name, email or age.
+  note: `idd` is not a tag of core/Clause either, so this list was read as core/Columns. The tags of core/Clause are *, distinct, where, order-by, limit or offset.
+#+END_SRC
+
+This package talks to no database. It turns a statement into text and
+parameters, and a driver runs that. [[file:../bjosqlite][bjosqlite]] is the
+driver for SQLite. A driver for another database needs only a ~Dialect~ and the
+code that runs a ~Statement~, so the grammar, the tables and the type checking
+are the same for every database.
+
+** Declaring a table
+
+#+BEGIN_SRC scheme
+(def/table users User
+  (id int #:primary-key #:auto)
+  (name string)
+  (email (Option string)))
+#+END_SRC
+
+declares:
+
+| ~User~       | the row record, with one field for each column               |
+| ~UserColumn~ | the column names: ~id~, ~name~, ~email~                       |
+| ~UserTest~   | the tests on each column: ~(Test int)~, ~(NTest string)~ and so on |
+| ~UserSet~    | the values each column can be set to                          |
+| ~UserSelect~ | ~(Select UserColumn UserTest)~, the type of a query literal   |
+| ~UserChange~ | ~(Change UserSet UserTest)~, for updates and deletes          |
+| ~UserCond~   | ~(Cond UserTest)~, for a condition built on its own           |
+| ~users~      | the ~Table~ value you pass to a driver                        |
+
+The column types are ~int~ and ~long~ (stored as integers), ~double~, ~string~,
+~bool~ and ~(Array byte)~, and ~(Option T)~ of any of them for a nullable
+column. For any other type, use ~#:sql-type "TIMESTAMP"~ and give the type
+~ToSql~ and ~FromSql~ implementations.
+
+The column options are ~#:primary-key~ (on several columns, it makes a composite
+key), ~#:auto~ (the database assigns the value, so the column is left out of an
+insert), and ~#:sql-type~. To give the table a different name in SQL, write
+~#:sql-name "app_users"~ after the record's name.
+
+The expansion refers to the grammar's types (~Test~, ~Table~, ~IntegerType~) by
+name, so the module that uses ~def/table~ must import ~(bjosql core)~ without a
+prefix.
+
+** Queries
+
+#+BEGIN_SRC scheme
+'(select)                                        ;; every column
+'(select (id name) (where (id (in 1 2 3))))
+'(select distinct (name) (order-by name) (limit 10) (offset 20))
+'(update (set (name "Ada") (email null)) (where (id (= ,n))))
+'(delete (where (age (< 18))))
+#+END_SRC
+
+The clauses of a ~select~ can be written in any order. The columns are the
+table's columns when the query names none, or when it writes ~*~. Columns are
+always written out in the SQL, because a driver reads a row back by column name.
+Several ~where~ clauses must all hold.
+
+| Test                 | On                                   |
+|----------------------+--------------------------------------|
+| ~(= v)~ ~(<> v)~ ~(< v)~ ~(<= v)~ ~(> v)~ ~(>= v)~ | every column             |
+| ~(between lo hi)~    | every column                         |
+| ~(in v ...)~         | every column; ~(in)~ matches nothing |
+| ~(like "A%")~        | every column; the pattern is a string |
+| ~is-null~ ~not-null~ | ~Option~ columns only                |
+
+Conditions combine with ~(and c ...)~, ~(or c ...)~ and ~(not c)~. Ordering is
+~name~, ~(asc name)~ or ~(desc name)~.
+
+The value in a test has the column's type, and a nullable column takes the
+value without ~Some~. In an update, a nullable column is set from a value, from
+~null~, or from an ~Option~ spliced with a comma:
+~(email ,(record-ref u email))~.
+
+*A quoted ~None~ is a symbol.* Write ~,None~, or ~null~ in a ~set~.
+
+** Composing queries
+
+A literal takes its type from the place it is written, so a function can
+return part of a query. The literal is also read correctly through an ~if~, a
+~let~ or a ~match~. A comma splices the value in:
+
+#+BEGIN_SRC scheme
+(: named (-> string UserCond))
+(defun (named who) '(name (= ,who)))
+
+(: visible (-> bool UserCond))
+(defun (visible admin?)
+  (if admin? '(id (>= 0)) '(email not-null)))
+
+(: find-user (-> string bool UserSelect))
+(defun (find-user who admin?)
+  '(select (where (and ,(named who) ,(visible admin?))) (limit 1)))
+#+END_SRC
+
+** SQL written by hand
+
+#+BEGIN_SRC scheme
+(sql "SELECT count(*) AS n FROM users WHERE age > ?" (list (to-sql 18)))
+
+'(select (where (and (age (> 18)) ,(sql "length(name) > ?" (list (to-sql 3))))))
+#+END_SRC
+
+Each ~?~ becomes a parameter. A ~?~ inside a quoted string or quoted name stays
+as text. If the number of ~?~ and the number of values differ, ~sql~ throws,
+because that is a mistake in the program. ~sql-raw~, ~sql-param~, ~sql-name~,
+~sql-concat~ and ~sql-join~ build statements piece by piece.
+
+Values never become part of the SQL text; they are always parameters.
+~sql-raw~ is the one way to insert text directly, so never build its argument
+from data.
+
+** Values and rows
+
+~SqlValue~ is what a database stores: ~SqlNull~, ~(SqlInt long)~, ~(SqlReal
+double)~, ~(SqlText string)~, ~(SqlBlob (Array byte))~, ~(SqlBool bool)~.
+~ToSql~ turns a Bjolang value into one, and ~FromSql~ reads one back. When the
+value does not fit, ~FromSql~ says what arrived.
+
+A driver returns ~Row~ values, which hold the result's column names and values.
+~(row-field row "n")~ reads one column as whatever type the use site asks for.
+~decode-row~ reads a whole row into the table's record, by column name. A
+missing column or a value of the wrong kind is a ~DecodeError~ that names the
+column.
+
+** Writing a driver
+
+#+BEGIN_SRC scheme
+(def postgres-dialect
+  (record-set standard-dialect
+              (placeholder (fun (n) (str "$" (int->string n))))))
+
+(render postgres-dialect (select->sql users '(select (where (id (= 3))))))
+;; => (Statement (text "SELECT \"id\", ... FROM \"users\" WHERE \"id\" = $1")
+;;               (params [(SqlInt 3)]))
+#+END_SRC
+
+~select->sql~, ~change->sql~, ~insert->sql~ and ~create-table->sql~ produce a
+~Sql~ value. ~render~ turns it into a ~Statement~ using the dialect: the
+placeholders, name quoting, column type names, what an auto-numbered key is
+called, and the ~LIMIT~ that an ~OFFSET~ without one needs. An insert ends in
+~RETURNING~ with every column, so the driver can return the stored row. This
+works in SQLite 3.35 and later, PostgreSQL and MariaDB, but not MySQL.
+
+** Tests
+
+#+BEGIN_SRC sh
+bjo run tests/render.bjo     # every line should start with "ok:"
+#+END_SRC

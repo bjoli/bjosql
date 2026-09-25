@@ -1,0 +1,946 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjosql/src/core.bjo — the module (bjosql core).
+;;
+;; SQL as data, for any database. A table is declared once:
+;;
+;;     (def/table users User
+;;       (id int #:primary-key #:auto)
+;;       (name string)
+;;       (email (Option string)))
+;;
+;; and a query against it is a quoted literal the type checker reads:
+;;
+;;     '(select (id name) (where (and (id (>= ,n)) (email not-null))) (limit 10))
+;;
+;; The grammar — `select`, `where`, `and`, `order-by` — is written here once,
+;; generic over a table's words. `def/table` supplies the words: the columns,
+;; and for each column the tests its type allows, so `(name (= ,3))` is a type
+;; error and `is-null` exists only on an `Option` column.
+;;
+;; Nothing here talks to a database. A statement becomes a `Sql` value, a list
+;; of text, names and parameters; a driver renders it with its `Dialect` and
+;; runs it. Values never become SQL text: they travel as parameters.
+
+(export
+  ;; Values
+  SqlValue ToSql to-sql FromSql from-sql describe-sql-value Nullable
+
+  ;; Errors
+  SqlError sql-error-message
+
+  ;; Fragments
+  Piece Sql sql sql-raw sql-param sql-name sql-append sql-concat sql-join sql-pieces
+
+  ;; Rendering
+  Dialect Statement statement-text statement-params
+  standard-dialect quote-name-standard render
+
+  ;; The grammar
+  Test NTest Cond Order Clause Select UpdateClause DeleteClause Change
+
+  ;; Tables
+  ColumnType Column Table make-column make-table
+  table-name table-columns column-name column-type column-nullable? column-primary-key? column-auto?
+
+  ;; Statements
+  select->sql change->sql insert->sql create-table->sql
+
+  ;; Rows
+  Row make-row row-columns row-values row-value row-field decode-row decode-rows
+
+  ;; What def/table's expansion calls
+  test->sql ntest->sql assign->sql
+
+  def/table)
+
+(import (std prelude))
+(import (std syntax-match))
+
+(import/class
+  (ArgumentException (: System.ArgumentException (-> string ArgumentException))))
+
+
+;; ---------------------------------------------------------------------------
+;; Values
+;; ---------------------------------------------------------------------------
+
+;; A value as it crosses to and from a database. The cases are the storage
+;; classes most databases share; a driver maps its own types onto them.
+(type (: SqlValue (Union SqlNull
+                         (SqlInt long)
+                         (SqlReal double)
+                         (SqlText string)
+                         (SqlBlob (Array byte))
+                         (SqlBool bool))))
+
+;; For messages: what kind of value this is, and a short look at it.
+(: describe-sql-value (-> SqlValue string))
+(defun (describe-sql-value v)
+  (match v
+    ((SqlNull) "NULL")
+    ((SqlInt n) (str "the integer " (long->string n)))
+    ((SqlReal d) (str "the real " (double->string d)))
+    ((SqlText s) (str "the text \"" (if (> (string-length s) 40) (str (string-take s 40) "...") s) "\""))
+    ((SqlBlob b) (str "a blob of " (int->string (array-length b)) " bytes"))
+    ((SqlBool b) (if b "true" "false"))))
+
+(: string-take (-> string int string))
+(defun (string-take s n)
+  (list->string (loop (:for c (string->list s)) (:with i 0 (+ i 1)) (:break (>= i n)) (:acc out (listing c)) => out)))
+
+;; A Bjolang value that can be a parameter.
+(def/trait (ToSql %v)
+  (: to-sql (-> %v SqlValue)))
+
+(impl (ToSql SqlValue) (defun (to-sql v) v))
+(impl (ToSql int) (defun (to-sql n) (SqlInt (cast System.Int64 n))))
+(impl (ToSql long) (defun (to-sql n) (SqlInt n)))
+(impl (ToSql double) (defun (to-sql d) (SqlReal d)))
+(impl (ToSql string) (defun (to-sql s) (SqlText s)))
+(impl (ToSql bool) (defun (to-sql b) (SqlBool b)))
+(impl (ToSql (Array byte)) (defun (to-sql b) (SqlBlob b)))
+
+(impl (ToSql (Option %a))
+  (where (ToSql %a))
+  (defun (to-sql o)
+    (match o
+      ((Some x) (to-sql x))
+      (None SqlNull))))
+
+;; What an update sets a nullable column to. A literal reads as one:
+;; `(email "a@b.c")` is a value, `(email null)` is NULL, and `(email ,maybe)`
+;; takes an `(Option string)` as it is.
+(type (: (Nullable %v) (Union (NullValue #:tag null)
+                              (Value %v)
+                              (MaybeValue (Option %v)))))
+
+(impl (ToSql (Nullable %v))
+  (where (ToSql %v))
+  (defun (to-sql n)
+    (match n
+      ((NullValue) SqlNull)
+      ((Value v) (to-sql v))
+      ((MaybeValue o) (to-sql o)))))
+
+;; A Bjolang value a column can be read into. The error says what arrived.
+(def/trait (FromSql %v)
+  (: from-sql (-> SqlValue (Result string %v))))
+
+(: expected (-> string SqlValue (Result string %a)))
+(defun (expected what v)
+  (Err (str "expected " what ", got " (describe-sql-value v))))
+
+(impl (FromSql SqlValue) (defun (from-sql v) (Ok v)))
+
+(impl (FromSql long)
+  (defun (from-sql v)
+    (match v
+      ((SqlInt n) (Ok n))
+      (_ (expected "an integer" v)))))
+
+(impl (FromSql int)
+  (defun (from-sql v)
+    (match v
+      ((SqlInt n)
+       (if (and (>= n -2147483648L) (<= n 2147483647L))
+           (Ok (cast System.Int32 n))
+           (Err (str "the integer " (long->string n) " does not fit an int"))))
+      (_ (expected "an integer" v)))))
+
+;; A database may hand back a whole number for a REAL column: SQLite stores
+;; 1.0 as the integer 1 when the column has no declared type.
+(impl (FromSql double)
+  (defun (from-sql v)
+    (match v
+      ((SqlReal d) (Ok d))
+      ((SqlInt n) (Ok (cast System.Double n)))
+      (_ (expected "a real" v)))))
+
+(impl (FromSql string)
+  (defun (from-sql v)
+    (match v
+      ((SqlText s) (Ok s))
+      (_ (expected "text" v)))))
+
+;; SQLite has no boolean and stores one as 0 or 1.
+(impl (FromSql bool)
+  (defun (from-sql v)
+    (match v
+      ((SqlBool b) (Ok b))
+      ((SqlInt 0L) (Ok #f))
+      ((SqlInt 1L) (Ok #t))
+      (_ (expected "a boolean" v)))))
+
+(impl (FromSql (Array byte))
+  (defun (from-sql v)
+    (match v
+      ((SqlBlob b) (Ok b))
+      (_ (expected "a blob" v)))))
+
+(impl (FromSql (Option %a))
+  (where (FromSql %a))
+  (defun (from-sql v)
+    (match v
+      ((SqlNull) (Ok None))
+      (other (match (from-sql other)
+               ((Ok x) (Ok (Some x)))
+               ((Err why) (Err why)))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Errors
+;; ---------------------------------------------------------------------------
+
+(type (: SqlError (Union
+                    ;; The database refused: its own code, and its message.
+                    (DbError string string)
+                    ;; A row that does not fit the record it was read into.
+                    (DecodeError string)
+                    ;; A statement that cannot be written, such as an update
+                    ;; with nothing to set.
+                    (BadQuery string))))
+
+(: sql-error-message (-> SqlError string))
+(defun (sql-error-message e)
+  (match e
+    ((DbError _ message) message)
+    ((DecodeError message) message)
+    ((BadQuery message) message)))
+
+
+;; ---------------------------------------------------------------------------
+;; Columns and rows
+;; ---------------------------------------------------------------------------
+
+;; A column's type in CREATE TABLE. The dialect names it.
+(type (: ColumnType (Union IntegerType RealType TextType BlobType BoolType (CustomType string))))
+
+(type (: Column (Record (: name string)
+                        (: type ColumnType)
+                        (: nullable bool)
+                        (: primary-key bool)
+                        ;; Numbered by the database: left out of an insert.
+                        (: auto bool))))
+
+(: make-column (-> string ColumnType bool bool bool Column))
+(defun (make-column name type nullable primary-key auto)
+  (Column (name name) (type type) (nullable nullable) (primary-key primary-key) (auto auto)))
+
+(: column-name (-> Column string))
+(defun (column-name c) (record-ref c name))
+
+(: column-type (-> Column ColumnType))
+(defun (column-type c) (record-ref c type))
+
+(: column-nullable? (-> Column bool))
+(defun (column-nullable? c) (record-ref c nullable))
+
+(: column-primary-key? (-> Column bool))
+(defun (column-primary-key? c) (record-ref c primary-key))
+
+(: column-auto? (-> Column bool))
+(defun (column-auto? c) (record-ref c auto))
+
+;; A row as a driver reads it: the result's column names, and a value for each.
+(type (: Row (Record (: columns (Vec string)) (: values (Vec SqlValue)))))
+
+(: make-row (-> (Vec string) (Vec SqlValue) Row))
+(defun (make-row columns values) (Row (columns columns) (values values)))
+
+(: row-columns (-> Row (Vec string)))
+(defun (row-columns r) (record-ref r columns))
+
+(: row-values (-> Row (Vec SqlValue)))
+(defun (row-values r) (record-ref r values))
+
+
+;; ---------------------------------------------------------------------------
+;; Fragments
+;; ---------------------------------------------------------------------------
+
+;; A piece of a statement. Everything that differs between databases is a
+;; piece of its own, and the dialect decides its text when it is rendered.
+(type (: Piece (Union
+                 (Raw string)             ;; SQL text, as written
+                 (Param SqlValue)         ;; a value: a placeholder in the text
+                 (Name string)            ;; a table or column name, to be quoted
+                 (TypeName ColumnType)    ;; a column type, in CREATE TABLE
+                 AutoKey                  ;; what makes a key column number itself
+                 NoLimit)))               ;; a LIMIT that limits nothing
+
+;; A statement, or part of one.
+(type (: Sql (Record (: pieces (List Piece)))))
+
+(: sql-pieces (-> Sql (List Piece)))
+(defun (sql-pieces s) (record-ref s pieces))
+
+(: piece (-> Piece Sql))
+(defun (piece p) (Sql (pieces (Cons p Nil))))
+
+;; Text that is SQL as it stands. Never build one out of a value.
+(: sql-raw (-> string Sql))
+(defun (sql-raw text) (piece (Raw text)))
+
+(: sql-param (-> %v Sql) (where (ToSql %v)))
+(defun (sql-param v) (piece (Param (to-sql v))))
+
+(: sql-name (-> string Sql))
+(defun (sql-name name) (piece (Name name)))
+
+(: sql-append (-> Sql Sql Sql))
+(defun (sql-append a b) (Sql (pieces (list-append (sql-pieces a) (sql-pieces b)))))
+
+(: sql-concat (-> (List Sql) Sql))
+(defun (sql-concat parts)
+  (Sql (pieces (list-foldr (fun (part acc) (list-append (sql-pieces part) acc)) Nil parts))))
+
+(: sql-join (-> string (List Sql) Sql))
+(defun (sql-join sep parts)
+  (match parts
+    (Nil (sql-concat Nil))
+    ((Cons first rest)
+     (sql-concat (Cons first (list-foldr (fun (part acc) (Cons (sql-raw sep) (Cons part acc)))
+                                         Nil rest))))))
+
+;; A program that is wrong, rather than a database that said no.
+(: throw-argument (-> string %a))
+(defun (throw-argument message)
+  (raise (cast Exception (ArgumentException. message))))
+
+;; SQL written by hand, with a `?` for each value:
+;;
+;;     (sql "SELECT count(*) AS n FROM users WHERE age > ?" (list (to-sql 18)))
+;;
+;; A `?` inside a quoted string or name is text, not a placeholder. The number
+;; of `?`s and of values have to agree; when they do not, it is the program
+;; that is wrong, and this throws.
+(: sql (-> string (List SqlValue) Sql))
+(defun (sql text values)
+  (defun (flush (: buffer (List char)) (: out (List Piece))) : (List Piece)
+    (if (empty? buffer) out (Cons (Raw (list->string (list-reverse buffer))) out)))
+  (let go ((chars (string->list text)) (buffer Nil) (quote None) (left values) (out Nil))
+    (match chars
+      (Nil
+       (match left
+         (Nil (Sql (pieces (list-reverse (flush buffer out)))))
+         (_ (throw-argument (str "sql: more values than ? in \"" text "\"")))))
+      ((Cons c more)
+       (match quote
+         ((Some q)
+          (go more (Cons c buffer) (if (char=? c q) None quote) left out))
+         (None
+          (cond
+            ((or (char=? c #\') (char=? c #\"))
+             (go more (Cons c buffer) (Some c) left out))
+            ((char=? c #\?)
+             (match left
+               (Nil (throw-argument (str "sql: more ? than values in \"" text "\"")))
+               ((Cons v rest)
+                (go more Nil None rest (Cons (Param v) (flush buffer out))))))
+            (else (go more (Cons c buffer) None left out)))))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Rendering
+;; ---------------------------------------------------------------------------
+
+;; What differs between databases, as far as this library writes SQL.
+(type (: Dialect (Record
+                   ;; The placeholder for the nth parameter, counting from 1:
+                   ;; `?`, `$1`, `@p1`.
+                   (: placeholder (-> int string))
+                   (: quote-name (-> string string))
+                   (: type-name (-> ColumnType string))
+                   ;; Written after the type of a column that numbers itself,
+                   ;; with its leading space, or "".
+                   (: auto-key string)
+                   ;; The LIMIT an OFFSET without one needs, with its leading
+                   ;; space, or "".
+                   (: no-limit string))))
+
+;; What a driver runs: the text, and the values for its placeholders in order.
+(type (: Statement (Record (: text string) (: params (Vec SqlValue)))))
+
+(: statement-text (-> Statement string))
+(defun (statement-text s) (record-ref s text))
+
+(: statement-params (-> Statement (Vec SqlValue)))
+(defun (statement-params s) (record-ref s params))
+
+;; `"name"`, with a `"` inside doubled. Standard SQL, and what SQLite and
+;; PostgreSQL both read.
+(: quote-name-standard (-> string string))
+(defun (quote-name-standard name) (str "\"" (string-replace name "\"" "\"\"") "\""))
+
+(: standard-type-name (-> ColumnType string))
+(defun (standard-type-name t)
+  (match t
+    ((IntegerType) "BIGINT")
+    ((RealType) "DOUBLE PRECISION")
+    ((TextType) "TEXT")
+    ((BlobType) "BLOB")
+    ((BoolType) "BOOLEAN")
+    ((CustomType name) name)))
+
+;; Standard SQL with `?` placeholders. A driver usually starts from this and
+;; changes what its database does differently, with `record-set`.
+(: standard-dialect Dialect)
+(def standard-dialect
+  (Dialect (placeholder (fun (n) "?"))
+           (quote-name quote-name-standard)
+           (type-name standard-type-name)
+           (auto-key " GENERATED BY DEFAULT AS IDENTITY")
+           (no-limit "")))
+
+(: render (-> Dialect Sql Statement))
+(defun (render dialect s)
+  (defun (text-of (: p Piece) (: n int)) : string
+    (match p
+      ((Raw text) text)
+      ((Param _) ((record-ref dialect placeholder) n))
+      ((Name name) ((record-ref dialect quote-name) name))
+      ((TypeName t) ((record-ref dialect type-name) t))
+      ((AutoKey) (record-ref dialect auto-key))
+      ((NoLimit) (record-ref dialect no-limit))))
+  (def texts
+    (loop (:for p (sql-pieces s))
+          (:with n 1 (match p ((Param _) (+ n 1)) (_ n)))
+          (:acc out (listing (text-of p n)))
+          => out))
+  (def params
+    (loop (:for p (sql-pieces s))
+          (:when-let (Param v) p)
+          (:acc out (vecing v))
+          => out))
+  (Statement (text (string-join (list->vec texts) "")) (params params)))
+
+
+;; ---------------------------------------------------------------------------
+;; The grammar
+;; ---------------------------------------------------------------------------
+;;
+;; Generic over a table's words: `%col` is its columns, `%test` the tests on
+;; them, `%set` the assignments to them. `def/table` declares those three for
+;; a table, and a literal at `(Select UserColumn UserTest)` is read against
+;; them.
+
+;; A comparison against a value of the column's type.
+(type (: (Test %v) (Union (Eq %v #:tag =)
+                          (Ne %v #:tag <>)
+                          (Lt %v #:tag <)
+                          (Le %v #:tag <=)
+                          (Gt %v #:tag >)
+                          (Ge %v #:tag >=)
+                          (Between %v %v #:tag between)
+                          (In (List %v) #:tag in #:rest)
+                          (Like string #:tag like))))
+
+;; The tests on a nullable column: the null checks, and through the untagged
+;; `Is` every test of `Test` — `(email (= "x"))` is `(Is (Eq "x"))`.
+(type (: (NTest %v) (Union (IsNull #:tag is-null)
+                           (NotNull #:tag not-null)
+                           (Is (Test %v)))))
+
+;; A condition over a table's tests. A tag that is not `and`, `or` or `not`
+;; is a column, found through `Leaf`. `RawCond` is SQL written by hand, spliced
+;; in with `,`: `(and (id (> 3)) ,(sql "length(name) > ?" (list (to-sql 2))))`.
+(type-rec
+  (: (Cond %test) (Union (And (List (Cond %test)) #:tag and #:rest)
+                         (Or (List (Cond %test)) #:tag or #:rest)
+                         (Not (Cond %test) #:tag not)
+                         (RawCond Sql)
+                         (Leaf %test))))
+
+;; `(asc name)`, `(desc id)`, or the column alone for ascending.
+(type (: (Order %col) (Union (Asc %col #:tag asc)
+                             (Desc %col #:tag desc)
+                             (By %col))))
+
+;; The clauses of a select, in any order. The projection is the one clause
+;; with no tag: `(id name)`.
+(type (: (Clause %col %test) (Union (Columns (List %col))
+                                    (All #:tag *)
+                                    (Distinct #:tag distinct)
+                                    (Where (Cond %test) #:tag where)
+                                    (OrderBy (List (Order %col)) #:tag order-by #:rest)
+                                    (Limit int #:tag limit)
+                                    (Offset int #:tag offset))))
+
+(type (: (Select %col %test) (Union (SelectQuery (List (Clause %col %test)) #:tag select #:rest))))
+
+(type (: (UpdateClause %set %test) (Union (SetTo (List %set) #:tag set #:rest)
+                                          (UpdateWhere (Cond %test) #:tag where))))
+
+(type (: (DeleteClause %test) (Union (DeleteWhere (Cond %test) #:tag where))))
+
+;; What changes rows: `(update (set ...) (where ...))` or `(delete (where ...))`.
+(type (: (Change %set %test)
+         (Union (UpdateQuery (List (UpdateClause %set %test)) #:tag update #:rest)
+                (DeleteQuery (List (DeleteClause %test)) #:tag delete #:rest))))
+
+
+;; ---------------------------------------------------------------------------
+;; Rendering the grammar
+;; ---------------------------------------------------------------------------
+
+(: paren (-> Sql Sql))
+(defun (paren s) (sql-concat (list (sql-raw "(") s (sql-raw ")"))))
+
+(: comparison (-> string string %v Sql) (where (ToSql %v)))
+(defun (comparison column op v)
+  (sql-concat (list (sql-name column) (sql-raw op) (sql-param v))))
+
+;; One test on one column. Called by the code `def/table` writes.
+(: test->sql (-> string (Test %v) Sql) (where (ToSql %v)))
+(defun (test->sql column t)
+  (match t
+    ((Eq v) (comparison column " = " v))
+    ((Ne v) (comparison column " <> " v))
+    ((Lt v) (comparison column " < " v))
+    ((Le v) (comparison column " <= " v))
+    ((Gt v) (comparison column " > " v))
+    ((Ge v) (comparison column " >= " v))
+    ((Between lo hi)
+     (sql-concat (list (sql-name column) (sql-raw " BETWEEN ") (sql-param lo)
+                       (sql-raw " AND ") (sql-param hi))))
+    ;; `IN ()` is not SQL everywhere, and an empty set holds nothing.
+    ((In vs)
+     (if (empty? vs)
+         (sql-raw "1 = 0")
+         (sql-concat (list (sql-name column) (sql-raw " IN (")
+                           (sql-join ", " (list-map sql-param vs)) (sql-raw ")")))))
+    ((Like pattern) (comparison column " LIKE " pattern))))
+
+(: ntest->sql (-> string (NTest %v) Sql) (where (ToSql %v)))
+(defun (ntest->sql column t)
+  (match t
+    ((IsNull) (sql-append (sql-name column) (sql-raw " IS NULL")))
+    ((NotNull) (sql-append (sql-name column) (sql-raw " IS NOT NULL")))
+    ((Is inner) (test->sql column inner))))
+
+;; `"column" = ?`, for an update's `set`.
+(: assign->sql (-> string %v Sql) (where (ToSql %v)))
+(defun (assign->sql column v) (comparison column " = " v))
+
+(: cond->sql (-> (-> %test Sql) (Cond %test) Sql))
+(defun (cond->sql leaf c)
+  (match c
+    ((And cs) (if (empty? cs) (sql-raw "1 = 1") (paren (sql-join " AND " (list-map #(cond->sql leaf &) cs)))))
+    ((Or cs) (if (empty? cs) (sql-raw "1 = 0") (paren (sql-join " OR " (list-map #(cond->sql leaf &) cs)))))
+    ((Not inner) (sql-append (sql-raw "NOT ") (paren (cond->sql leaf inner))))
+    ((RawCond s) (paren s))
+    ((Leaf t) (leaf t))))
+
+;; Several `where` clauses mean all of them.
+(: where->sql (-> (-> %test Sql) (List (Cond %test)) Sql))
+(defun (where->sql leaf conds)
+  (match conds
+    (Nil (sql-concat Nil))
+    ((Cons only Nil) (sql-append (sql-raw " WHERE ") (cond->sql leaf only)))
+    (_ (sql-append (sql-raw " WHERE ") (cond->sql leaf (And conds))))))
+
+(: list-concat (-> (List (List %a)) (List %a)))
+(defun (list-concat lists) (list-foldr list-append Nil lists))
+
+(: last-of (-> (List %a) (Option %a)))
+(defun (last-of xs)
+  (match xs
+    (Nil None)
+    ((Cons x Nil) (Some x))
+    ((Cons _ rest) (last-of rest))))
+
+
+;; ---------------------------------------------------------------------------
+;; Tables
+;; ---------------------------------------------------------------------------
+
+;; A table: its name and columns, and the functions over its words that
+;; `def/table` writes. `%row` is the record a row is read into.
+(type (: (Table %row %col %test %set)
+         (Record (: name string)
+                 (: columns (List Column))
+                 (: col-name (-> %col string))
+                 (: test (-> %test Sql))
+                 (: assign (-> %set Sql))
+                 (: values (-> %row (List SqlValue)))
+                 (: decode (-> Row (Result SqlError %row))))))
+
+(: make-table (-> string (List Column) (-> %col string) (-> %test Sql) (-> %set Sql)
+                  (-> %row (List SqlValue)) (-> Row (Result SqlError %row))
+                  (Table %row %col %test %set)))
+(defun (make-table name columns col-name test assign values decode)
+  (Table (name name) (columns columns) (col-name col-name) (test test)
+         (assign assign) (values values) (decode decode)))
+
+(: table-name (-> (Table %row %col %test %set) string))
+(defun (table-name t) (record-ref t name))
+
+(: table-columns (-> (Table %row %col %test %set) (List Column)))
+(defun (table-columns t) (record-ref t columns))
+
+(: all-columns (-> (Table %row %col %test %set) Sql))
+(defun (all-columns table)
+  (sql-join ", " (list-map #(sql-name (column-name &)) (table-columns table))))
+
+
+;; ---------------------------------------------------------------------------
+;; Statements
+;; ---------------------------------------------------------------------------
+
+;; SELECT. The columns are the table's when the query names none, or says `*`,
+;; and are always written out: a row is read back by column name.
+(: select->sql (-> (Table %row %col %test %set) (Select %col %test) Sql))
+(defun (select->sql table q)
+  (def (SelectQuery clauses) q)
+  (def col-name (record-ref table col-name))
+  (def named (list-concat (loop (:for c clauses) (:when-let (Columns cs) c) (:acc out (listing cs)) => out)))
+  (def distinct? (any? #(match & ((Distinct) #t) (_ #f)) clauses))
+  (def wheres (loop (:for c clauses) (:when-let (Where w) c) (:acc out (listing w)) => out))
+  (def orders (list-concat (loop (:for c clauses) (:when-let (OrderBy os) c) (:acc out (listing os)) => out)))
+  (def limit (last-of (loop (:for c clauses) (:when-let (Limit n) c) (:acc out (listing n)) => out)))
+  (def offset (last-of (loop (:for c clauses) (:when-let (Offset n) c) (:acc out (listing n)) => out)))
+  (defun (order->sql o) : Sql
+    (match o
+      ((Asc c) (sql-name (col-name c)))
+      ((By c) (sql-name (col-name c)))
+      ((Desc c) (sql-append (sql-name (col-name c)) (sql-raw " DESC")))))
+  (sql-concat
+    (list (sql-raw (if distinct? "SELECT DISTINCT " "SELECT "))
+          (if (empty? named)
+              (all-columns table)
+              (sql-join ", " (list-map #(sql-name (col-name &)) named)))
+          (sql-raw " FROM ")
+          (sql-name (table-name table))
+          (where->sql (record-ref table test) wheres)
+          (if (empty? orders)
+              (sql-concat Nil)
+              (sql-append (sql-raw " ORDER BY ") (sql-join ", " (list-map order->sql orders))))
+          (match (Tuple limit offset)
+            ((Tuple (Some n) _) (sql-append (sql-raw " LIMIT ") (sql-param n)))
+            ((Tuple None (Some _)) (piece NoLimit))
+            (_ (sql-concat Nil)))
+          (match offset
+            ((Some n) (sql-append (sql-raw " OFFSET ") (sql-param n)))
+            (None (sql-concat Nil))))))
+
+;; UPDATE or DELETE. An update with nothing to set is refused rather than
+;; sent: the database's own complaint would be about a syntax error.
+(: change->sql (-> (Table %row %col %test %set) (Change %set %test) (Result SqlError Sql)))
+(defun (change->sql table change)
+  (def test (record-ref table test))
+  (match change
+    ((UpdateQuery clauses)
+     (def sets (list-concat (loop (:for c clauses) (:when-let (SetTo ss) c) (:acc out (listing ss)) => out)))
+     (def wheres (loop (:for c clauses) (:when-let (UpdateWhere w) c) (:acc out (listing w)) => out))
+     (if (empty? sets)
+         (Err (BadQuery (str "an update of " (table-name table) " needs a (set ...) with something in it.")))
+         (Ok (sql-concat (list (sql-raw "UPDATE ")
+                               (sql-name (table-name table))
+                               (sql-raw " SET ")
+                               (sql-join ", " (list-map (record-ref table assign) sets))
+                               (where->sql test wheres))))))
+    ((DeleteQuery clauses)
+     (def wheres (list-map #(match & ((DeleteWhere w) w)) clauses))
+     (Ok (sql-concat (list (sql-raw "DELETE FROM ")
+                           (sql-name (table-name table))
+                           (where->sql test wheres)))))))
+
+;; INSERT of one row, answering the row as stored: with the key the database
+;; chose for an `#:auto` column. RETURNING is in SQLite 3.35 and later,
+;; PostgreSQL and MariaDB.
+(: insert->sql (-> (Table %row %col %test %set) %row Sql))
+(defun (insert->sql table row)
+  (def given
+    (loop (:for c (table-columns table))
+          (:for v ((record-ref table values) row))
+          (:acc out (listing (Tuple c v)) #:when (not (column-auto? c)))
+          => out))
+  (sql-concat
+    (list (sql-raw "INSERT INTO ")
+          (sql-name (table-name table))
+          (if (empty? given)
+              (sql-raw " DEFAULT VALUES")
+              (sql-concat
+                (list (sql-raw " (")
+                      (sql-join ", " (list-map (fun (cv) (def (c _) cv) (sql-name (column-name c))) given))
+                      (sql-raw ") VALUES (")
+                      (sql-join ", " (list-map (fun (cv) (def (_ v) cv) (sql-param v)) given))
+                      (sql-raw ")"))))
+          (sql-raw " RETURNING ")
+          (all-columns table))))
+
+;; CREATE TABLE IF NOT EXISTS. One key column is marked where it is declared,
+;; several make a composite key.
+(: create-table->sql (-> (Table %row %col %test %set) Sql))
+(defun (create-table->sql table)
+  (def keys (list-filter column-primary-key? (table-columns table)))
+  (def single-key? (= (list-length keys) 1))
+  (defun (column->sql (: c Column)) : Sql
+    (sql-concat
+      (list (sql-name (column-name c))
+            (sql-raw " ")
+            (piece (TypeName (column-type c)))
+            (if (and single-key? (column-primary-key? c)) (sql-raw " PRIMARY KEY") (sql-concat Nil))
+            (if (column-auto? c) (piece AutoKey) (sql-concat Nil))
+            (if (or (column-nullable? c) (column-primary-key? c)) (sql-concat Nil) (sql-raw " NOT NULL")))))
+  (sql-concat
+    (list (sql-raw "CREATE TABLE IF NOT EXISTS ")
+          (sql-name (table-name table))
+          (sql-raw " (")
+          (sql-join ", " (list-map column->sql (table-columns table)))
+          (if (> (list-length keys) 1)
+              (sql-concat (list (sql-raw ", PRIMARY KEY (")
+                                (sql-join ", " (list-map #(sql-name (column-name &)) keys))
+                                (sql-raw ")")))
+              (sql-concat Nil))
+          (sql-raw ")"))))
+
+
+;; ---------------------------------------------------------------------------
+;; Rows
+;; ---------------------------------------------------------------------------
+
+;; The value of the column called `column`, if the row has one. The name is
+;; compared exactly first and then ignoring case, which is how SQL compares
+;; an unquoted one.
+(: row-value (-> Row string (Option SqlValue)))
+(defun (row-value row column)
+  (def names (row-columns row))
+  (defun (index-where (: same? (-> string bool)) (: i int)) : (Option int)
+    (cond
+      ((>= i (vec-length names)) None)
+      ((same? (vec-ref names i)) (Some i))
+      (else (index-where same? (+ i 1)))))
+  (def lower (string-downcase column))
+  (match (match (index-where #(= & column) 0)
+           ((Some i) (Some i))
+           (None (index-where #(= (string-downcase &) lower) 0)))
+    ((Some i) (Some (vec-ref (row-values row) i)))
+    (None None)))
+
+;; The column called `column`, read as a `%v`.
+(: row-field (-> Row string (Result SqlError %v)) (where (FromSql %v)))
+(defun (row-field row column)
+  (match (row-value row column)
+    (None (Err (DecodeError (str "the result has no column " column "."))))
+    ((Some v)
+     (match (from-sql v)
+       ((Ok x) (Ok x))
+       ((Err why) (Err (DecodeError (str "column " column ": " why "."))))))))
+
+(: decode-row (-> (Table %row %col %test %set) Row (Result SqlError %row)))
+(defun (decode-row table row) ((record-ref table decode) row))
+
+;; Every row, or the first that does not fit.
+(: decode-rows (-> (Table %row %col %test %set) (List Row) (Result SqlError (List %row))))
+(defun (decode-rows table rows)
+  (let go ((left rows) (out Nil))
+    (match left
+      (Nil (Ok (list-reverse out)))
+      ((Cons row more)
+       (match (decode-row table row)
+         ((Ok r) (go more (Cons r out)))
+         ((Err e) (Err e)))))))
+
+
+;; ---------------------------------------------------------------------------
+;; def/table
+;; ---------------------------------------------------------------------------
+;;
+;;     (def/table users User
+;;       (id int #:primary-key #:auto)
+;;       (name string)
+;;       (email (Option string)))
+;;
+;; declares
+;;
+;;     User         the row record, with a field per column
+;;     UserColumn   the column names:        (UserColumn/id #:tag id) ...
+;;     UserTest     the tests on each:       (UserTest/id (Test int) #:tag id) ...
+;;                                           (UserTest/email (NTest string) #:tag email)
+;;     UserSet      the assignments to each: (UserSet/id int #:tag id) ...
+;;                                           (UserSet/email (Nullable string) #:tag email)
+;;     UserSelect   (Select UserColumn UserTest), what a query literal is read as
+;;     UserChange   (Change UserSet UserTest), for updates and deletes
+;;     UserCond     (Cond UserTest), for a condition built on its own
+;;     users        the Table value a driver is handed
+;;
+;; `#:sql-name "app_users"` after the record's name gives the table another
+;; name in SQL. A column's options are `#:primary-key`, `#:auto` (numbered by
+;; the database, and left out of an insert) and `#:sql-type "TEXT"` for a type
+;; this library does not know, which then needs `ToSql` and `FromSql`.
+;;
+;; The expansion names the grammar's types and constructors — `Test`,
+;; `Table`, `IntegerType` — where it lands, so the module using it imports
+;; (bjosql core) without a prefix.
+
+(type (: Spec (Record (: field Syntax)
+                      (: type Syntax)
+                      (: inner Syntax)
+                      (: nullable bool)
+                      (: column-type Syntax)
+                      (: key bool)
+                      (: auto bool))))
+
+(: sym (-> string Syntax))
+(defun (sym s) (SSym (string->symbol s)))
+
+(: refuse (-> Syntax string %a))
+(defun (refuse form message)
+  (ignore (syntax-error form message))
+  (throw-argument message))
+
+(: syntax-name (-> Syntax string))
+(defun (syntax-name s)
+  (match s
+    ((SSym x) (symbol->string x))
+    ((SDatum x) (symbol->string x))
+    (_ (refuse s "def/table: expected a name here."))))
+
+;; The column type a Bjolang type is stored as, unless `#:sql-type` said.
+(: known-column-type (-> Syntax (Option Syntax)))
+(defun (known-column-type t)
+  (def written (syntax->string t))
+  (cond
+    ((or (= written "int") (= written "long")) (Some (sym "IntegerType")))
+    ((= written "double") (Some (sym "RealType")))
+    ((= written "string") (Some (sym "TextType")))
+    ((= written "bool") (Some (sym "BoolType")))
+    ((= written "(Array byte)") (Some (sym "BlobType")))
+    (else None)))
+
+(: parse-options (-> Syntax (List Syntax) (Tuple bool bool (Option string))))
+(defun (parse-options spec options)
+  (match options
+    (Nil (Tuple #f #f None))
+    ((Cons option rest)
+     (def written (syntax->string option))
+     (cond
+       ((= written "#:primary-key")
+        (def (_ auto custom) (parse-options spec rest))
+        (Tuple #t auto custom))
+       ((= written "#:auto")
+        (def (key _ custom) (parse-options spec rest))
+        (Tuple key #t custom))
+       ((= written "#:sql-type")
+        (match rest
+          ((Cons (SStr name) more)
+           (def (key auto _) (parse-options spec more))
+           (Tuple key auto (Some name)))
+          (_ (refuse spec "def/table: #:sql-type is followed by the type's name in SQL, as a string."))))
+       (else
+        (refuse spec (str "def/table: " written " is not a column option. "
+                          "The options are #:primary-key, #:auto and #:sql-type \"TYPE\".")))))))
+
+(: parse-spec (-> Syntax Spec))
+(defun (parse-spec spec)
+  (syntax-match spec
+    ((field type options ...)
+     (def (key auto custom) (parse-options spec options))
+     ;; `(Option T)` is a nullable column of T.
+     (def (Tuple nullable inner)
+       (syntax-match type
+         (('Option inner) (Tuple #t inner))
+         (_ (Tuple #f type))))
+     (def column-type
+       (match custom
+         ((Some name) #'(CustomType ,(SStr name)))
+         (None
+          (match (known-column-type inner)
+            ((Some t) t)
+            (None (refuse spec (str "def/table: which SQL type is a column of " (syntax->string inner)
+                                    "? Say so with #:sql-type \"TYPE\", and give the type ToSql and FromSql.")))))))
+     (ignore (syntax-name field))
+     (Spec (field field) (type type) (inner inner) (nullable nullable)
+           (column-type column-type) (key key) (auto auto)))
+    (bad (refuse bad "def/table: a column is written (name type option ...), as in (email (Option string))."))))
+
+;; A name the expansion declares for the caller to use. Built with `inject`, so
+;; that hygiene leaves it as spelled: a renamed type or constructor would be
+;; declared under one name and looked up under another.
+(: case-name (-> (-> Symbol Syntax) string Spec Syntax))
+(defun (case-name inject union s)
+  (inject (string->symbol (str union "/" (syntax-name (record-ref s field))))))
+
+(: bool-syntax (-> bool Syntax))
+(defun (bool-syntax b) (if b (sym "#t") (sym "#f")))
+
+(: expand-table (-> (-> Symbol Syntax) Syntax Syntax string (List Syntax) Syntax))
+(defun (expand-table inject table row sql-name column-forms)
+  (def specs (list-map parse-spec column-forms))
+  (def row-name (syntax-name row))
+  (defun (declared (: suffix string)) : Syntax
+    (inject (string->symbol (str row-name suffix))))
+  (def col-type (declared "Column"))
+  (def test-type (declared "Test"))
+  (def set-type (declared "Set"))
+  (def col-union (str row-name "Column"))
+  (def test-union (str row-name "Test"))
+  (def set-union (str row-name "Set"))
+  (defun (field-string (: s Spec)) : Syntax
+    (SStr (syntax-name (record-ref s field))))
+  (def value-names
+    (loop (:for s specs)
+          (:with i 0 (+ i 1))
+          (:acc out (listing (sym (str "bjosql-field-" (int->string i)))))
+          => out))
+  #'(begin
+      (type (: ,row (Record ,@(list-map (fun (s) #'(: ,(record-ref s field) ,(record-ref s type))) specs))))
+      (type (: ,col-type (Union ,@(list-map (fun (s) #'(,(case-name inject col-union s) #:tag ,(record-ref s field))) specs))))
+      (type (: ,test-type
+               (Union ,@(list-map (fun (s)
+                                    (def inner (record-ref s inner))
+                                    (def test (if (record-ref s nullable) #'(NTest ,inner) #'(Test ,inner)))
+                                    #'(,(case-name inject test-union s) ,test #:tag ,(record-ref s field)))
+                                  specs))))
+      (type (: ,set-type
+               (Union ,@(list-map (fun (s)
+                                    (def payload (if (record-ref s nullable)
+                                                     #'(Nullable ,(record-ref s inner))
+                                                     (record-ref s type)))
+                                    #'(,(case-name inject set-union s) ,payload #:tag ,(record-ref s field)))
+                                  specs))))
+      (type (: ,(declared "Select") (Select ,col-type ,test-type)))
+      (type (: ,(declared "Change") (Change ,set-type ,test-type)))
+      (type (: ,(declared "Cond") (Cond ,test-type)))
+      (: ,table (Table ,row ,col-type ,test-type ,set-type))
+      (def ,table
+        (make-table
+          ,(SStr sql-name)
+          (list ,@(list-map (fun (s)
+                              #'(make-column ,(field-string s) ,(record-ref s column-type)
+                                             ,(bool-syntax (record-ref s nullable))
+                                             ,(bool-syntax (record-ref s key))
+                                             ,(bool-syntax (record-ref s auto))))
+                            specs))
+          (fun (c) (match c ,@(list-map (fun (s) #'((,(case-name inject col-union s)) ,(field-string s))) specs)))
+          (fun (t)
+            (match t
+              ,@(list-map (fun (s)
+                            (def render (if (record-ref s nullable) #'ntest->sql #'test->sql))
+                            #'((,(case-name inject test-union s) x) (,render ,(field-string s) x)))
+                          specs)))
+          (fun (a) (match a ,@(list-map (fun (s) #'((,(case-name inject set-union s) v) (assign->sql ,(field-string s) v))) specs)))
+          (fun (r) (list ,@(list-map (fun (s) #'(to-sql (record-ref r ,(record-ref s field)))) specs)))
+          (fun (row)
+            ,@(loop (:for s specs)
+                    (:for v value-names)
+                    (:acc out (listing #'(def (Ok ,v) (row-field row ,(field-string s)) :propagate)))
+                    => out)
+            (Ok (,row ,@(loop (:for s specs)
+                              (:for v value-names)
+                              (:acc out (listing #'(,(record-ref s field) ,v)))
+                              => out))))))))
+
+(def/macro (def/table form inject compare)
+  (syntax-match form
+    ((_ table row #:sql-name name column ...)
+     (match name
+       ((SStr text) (expand-table inject table row text column))
+       (_ (syntax-error name "def/table: #:sql-name is followed by the table's name in SQL, as a string."))))
+    ((_ table row column ...)
+     (expand-table inject table row (syntax-name table) column))
+    (bad (syntax-error bad "def/table is written (def/table users User (id int) (name string) ...)."))))
