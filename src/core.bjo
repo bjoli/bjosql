@@ -70,11 +70,11 @@
 ;; A value as it crosses to and from a database. The cases are the storage
 ;; classes most databases share; a driver maps its own types onto them.
 (type (: SqlValue (Union SqlNull
-                         (SqlInt long)
-                         (SqlReal double)
-                         (SqlText string)
-                         (SqlBlob (Array byte))
-                         (SqlBool bool))))
+                         (: SqlInt long)
+                         (: SqlReal double)
+                         (: SqlText string)
+                         (: SqlBlob (Array byte))
+                         (: SqlBool bool))))
 
 ;; For messages: what kind of value this is, and a short look at it.
 (: describe-sql-value (-> SqlValue string))
@@ -113,9 +113,9 @@
 ;; What an update sets a nullable column to. A literal reads as one:
 ;; `(email "a@b.c")` is a value, `(email null)` is NULL, and `(email ,maybe)`
 ;; takes an `(Option string)` as it is.
-(type (: (Nullable %v) (Union (NullValue #:tag null)
-                              (Value %v)
-                              (MaybeValue (Option %v)))))
+(type (: (Nullable %v) (Union (: NullValue #:tag null)
+                              (: Value %v)
+                              (: MaybeValue (Option %v)))))
 
 (impl (ToSql (Nullable %v))
   (where (ToSql %v))
@@ -196,12 +196,12 @@
 
 (type (: SqlError (Union
                     ;; The database refused: its own code, and its message.
-                    (DbError string string)
+                    (: DbError string string)
                     ;; A row that does not fit the record it was read into.
-                    (DecodeError string)
+                    (: DecodeError string)
                     ;; A statement that cannot be written, such as an update
                     ;; with nothing to set.
-                    (BadQuery string))))
+                    (: BadQuery string))))
 
 (: sql-error-message (-> SqlError string))
 (defun (sql-error-message e)
@@ -216,7 +216,7 @@
 ;; ---------------------------------------------------------------------------
 
 ;; A column's type in CREATE TABLE. The dialect names it.
-(type (: ColumnType (Union IntegerType RealType TextType BlobType BoolType (CustomType string))))
+(type (: ColumnType (Union IntegerType RealType TextType BlobType BoolType (: CustomType string))))
 
 (type (: Column (Record (: name string)
                         (: type ColumnType)
@@ -264,10 +264,10 @@
 ;; A piece of a statement. Everything that differs between databases is a
 ;; piece of its own, and the dialect decides its text when it is rendered.
 (type (: Piece (Union
-                 (Raw string)             ;; SQL text, as written
-                 (Param SqlValue)         ;; a value: a placeholder in the text
-                 (Name string)            ;; a table or column name, to be quoted
-                 (TypeName ColumnType)    ;; a column type, in CREATE TABLE
+                 (: Raw string)             ;; SQL text, as written
+                 (: Param SqlValue)         ;; a value: a placeholder in the text
+                 (: Name string)            ;; a table or column name, to be quoted
+                 (: TypeName ColumnType)    ;; a column type, in CREATE TABLE
                  AutoKey                  ;; what makes a key column number itself
                  NoLimit)))               ;; a LIMIT that limits nothing
 
@@ -426,58 +426,58 @@
 ;; them.
 
 ;; A comparison against a value of the column's type.
-(type (: (Test %v) (Union (Eq %v #:tag =)
-                          (Ne %v #:tag <>)
-                          (Lt %v #:tag <)
-                          (Le %v #:tag <=)
-                          (Gt %v #:tag >)
-                          (Ge %v #:tag >=)
-                          (Between %v %v #:tag between)
-                          (In (List %v) #:tag in #:rest)
-                          (Like string #:tag like))))
+(type (: (Test %v) (Union (: Eq %v #:tag =)
+                          (: Ne %v #:tag <>)
+                          (: Lt %v #:tag <)
+                          (: Le %v #:tag <=)
+                          (: Gt %v #:tag >)
+                          (: Ge %v #:tag >=)
+                          (: Between %v %v #:tag between)
+                          (: In (List %v) #:tag in #:rest)
+                          (: Like string #:tag like))))
 
 ;; The tests on a nullable column: the null checks, and through the untagged
 ;; `Is` every test of `Test` — `(email (= "x"))` is `(Is (Eq "x"))`.
-(type (: (NTest %v) (Union (IsNull #:tag is-null)
-                           (NotNull #:tag not-null)
-                           (Is (Test %v)))))
+(type (: (NTest %v) (Union (: IsNull #:tag is-null)
+                           (: NotNull #:tag not-null)
+                           (: Is (Test %v)))))
 
 ;; A condition over a table's tests. A tag that is not `and`, `or` or `not`
 ;; is a column, found through `Leaf`. `RawCond` is SQL written by hand, spliced
 ;; in with `,`: `(and (id (> 3)) ,(sql "length(name) > ?" (list (to-sql 2))))`.
 (type-rec
-  (: (Cond %test) (Union (And (List (Cond %test)) #:tag and #:rest)
-                         (Or (List (Cond %test)) #:tag or #:rest)
-                         (Not (Cond %test) #:tag not)
-                         (RawCond Sql)
-                         (Leaf %test))))
+  (: (Cond %test) (Union (: And (List (Cond %test)) #:tag and #:rest)
+                         (: Or (List (Cond %test)) #:tag or #:rest)
+                         (: Not (Cond %test) #:tag not)
+                         (: RawCond Sql)
+                         (: Leaf %test))))
 
 ;; `(asc name)`, `(desc id)`, or the column alone for ascending.
-(type (: (Order %col) (Union (Asc %col #:tag asc)
-                             (Desc %col #:tag desc)
-                             (By %col))))
+(type (: (Order %col) (Union (: Asc %col #:tag asc)
+                             (: Desc %col #:tag desc)
+                             (: By %col))))
 
 ;; The clauses of a select, in any order. The projection is the one clause
 ;; with no tag: `(id name)`.
-(type (: (Clause %col %test) (Union (Columns (List %col))
-                                    (All #:tag *)
-                                    (Distinct #:tag distinct)
-                                    (Where (Cond %test) #:tag where)
-                                    (OrderBy (List (Order %col)) #:tag order-by #:rest)
-                                    (Limit int #:tag limit)
-                                    (Offset int #:tag offset))))
+(type (: (Clause %col %test) (Union (: Columns (List %col))
+                                    (: All #:tag *)
+                                    (: Distinct #:tag distinct)
+                                    (: Where (Cond %test) #:tag where)
+                                    (: OrderBy (List (Order %col)) #:tag order-by #:rest)
+                                    (: Limit int #:tag limit)
+                                    (: Offset int #:tag offset))))
 
-(type (: (Select %col %test) (Union (SelectQuery (List (Clause %col %test)) #:tag select #:rest))))
+(type (: (Select %col %test) (Union (: SelectQuery (List (Clause %col %test)) #:tag select #:rest))))
 
-(type (: (UpdateClause %set %test) (Union (SetTo (List %set) #:tag set #:rest)
-                                          (UpdateWhere (Cond %test) #:tag where))))
+(type (: (UpdateClause %set %test) (Union (: SetTo (List %set) #:tag set #:rest)
+                                          (: UpdateWhere (Cond %test) #:tag where))))
 
-(type (: (DeleteClause %test) (Union (DeleteWhere (Cond %test) #:tag where))))
+(type (: (DeleteClause %test) (Union (: DeleteWhere (Cond %test) #:tag where))))
 
 ;; What changes rows: `(update (set ...) (where ...))` or `(delete (where ...))`.
 (type (: (Change %set %test)
-         (Union (UpdateQuery (List (UpdateClause %set %test)) #:tag update #:rest)
-                (DeleteQuery (List (DeleteClause %test)) #:tag delete #:rest))))
+         (Union (: UpdateQuery (List (UpdateClause %set %test)) #:tag update #:rest)
+                (: DeleteQuery (List (DeleteClause %test)) #:tag delete #:rest))))
 
 
 ;; ---------------------------------------------------------------------------
@@ -893,19 +893,19 @@
           => out))
   #'(begin
       (type (: ,row (Record ,@(list-map (fun (s) #'(: ,(record-ref s field) ,(record-ref s type))) specs))))
-      (type (: ,col-type (Union ,@(list-map (fun (s) #'(,(case-name inject col-union s) #:tag ,(record-ref s field))) specs))))
+      (type (: ,col-type (Union ,@(list-map (fun (s) #'(: ,(case-name inject col-union s) #:tag ,(record-ref s field))) specs))))
       (type (: ,test-type
                (Union ,@(list-map (fun (s)
                                     (def inner (record-ref s inner))
                                     (def test (if (record-ref s nullable) #'(NTest ,inner) #'(Test ,inner)))
-                                    #'(,(case-name inject test-union s) ,test #:tag ,(record-ref s field)))
+                                    #'(: ,(case-name inject test-union s) ,test #:tag ,(record-ref s field)))
                                   specs))))
       (type (: ,set-type
                (Union ,@(list-map (fun (s)
                                     (def payload (if (record-ref s nullable)
                                                      #'(Nullable ,(record-ref s inner))
                                                      (record-ref s type)))
-                                    #'(,(case-name inject set-union s) ,payload #:tag ,(record-ref s field)))
+                                    #'(: ,(case-name inject set-union s) ,payload #:tag ,(record-ref s field)))
                                   specs))))
       (type (: ,(declared "Select") (Select ,col-type ,test-type)))
       (type (: ,(declared "Change") (Change ,set-type ,test-type)))
