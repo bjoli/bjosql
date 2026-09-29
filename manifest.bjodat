@@ -1,6 +1,6 @@
 (package
   (name (bjosql))
-  (version "0.1.0")
+  (version "0.2.0")
   (description "SQL as data: a query grammar written once, tables that supply its words, values that travel as parameters.")
   (license "MPL-2.0")
 
