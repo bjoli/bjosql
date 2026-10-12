@@ -26,6 +26,17 @@
   (total long)
   (note (Option Instant)))
 
+(def/table settings Setting
+  (key string #:primary-key)
+  (value Json)
+  (extra (Option Json)))
+
+(: some-json (-> string Json))
+(defun (some-json text)
+  (match (parse-json text)
+    ((Ok j) j)
+    ((Err why) (panic! why))))
+
 (: some! (-> (Option %a) %a))
 (defun (some! o)
   (match o
@@ -309,6 +320,23 @@
           (show (insert->sql tags (Tag (id 1) (name "knee"))))
           (str "INSERT INTO \"tags\" (\"id\", \"name\") VALUES ($1, $2) RETURNING \"id\", \"name\""
                " | the integer 1, the text \"knee\""))
+
+  ;; --- Json columns ---------------------------------------------------------------------
+  (def tree (some-json "{\"b\": [true, 2.0], \"a\": \"knee\"}"))
+  (expect "a Json column is JSON"
+          (show (create-table->sql settings))
+          "CREATE TABLE IF NOT EXISTS \"settings\" (\"key\" TEXT PRIMARY KEY, \"value\" JSON NOT NULL, \"extra\" JSON)")
+  (expect "a Json is sent as compact text, its keys sorted"
+          (show (insert->sql settings (Setting (key "k") (value tree) (extra None))))
+          (str "INSERT INTO \"settings\" (\"key\", \"value\", \"extra\") VALUES ($1, $2, $3)"
+               " RETURNING \"key\", \"value\", \"extra\""
+               " | the text \"k\", the JSON {\"a\":\"knee\",\"b\":[true,2.0]}, NULL"))
+  (expect "a row reads back into a Json"
+          (match (decode-row settings (make-row ["key" "value" "extra"]
+                                                [(SqlText "k") (SqlJson "{\"b\": 1, \"a\": [null]}") SqlNull]))
+            ((Ok s) (json->string (record-ref s value)))
+            ((Err e) (sql-error-message e)))
+          "{\"a\":[null],\"b\":1}")
 
   ;; --- a cast for SqlOther ------------------------------------------------------------
   (expect "the standard dialect writes no cast"

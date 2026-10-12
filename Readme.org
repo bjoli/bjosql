@@ -71,11 +71,13 @@ The column types, and ~(Option T)~ of any of them for a nullable column:
 | ~Instant~      | ~TIMESTAMP WITH TIME ZONE~ | ~TEXT~: ~2026-10-12 12:05:09.000000Z~   |
 | ~decimal~      | ~NUMERIC~                  | ~TEXT~: ~-12.50~                        |
 | ~Uuid~         | ~UUID~                     | ~TEXT~: lower case, with hyphens       |
+| ~Json~         | ~JSONB~ (~JSON~)           | ~TEXT~                                 |
 | ~JsonDoc~      | ~JSONB~ (~JSON~)           | ~TEXT~                                 |
 
-~Date~, ~Time~, ~DateTime~ and ~Instant~ are ~(std datetime)~'s, and ~Uuid~ is
-~(std uuid)~'s. ~JsonDoc~ is the text of a JSON value: ~(json-doc "{...}")~. A
-JSON column also reads as ~(text json)~'s ~Json~ with ~row-field~.
+~Date~, ~Time~, ~DateTime~ and ~Instant~ are ~(std datetime)~'s, ~Uuid~ is
+~(std uuid)~'s, and ~Json~ is ~(text json)~'s tree. A ~Json~ is written as
+compact text with the keys of an object in sorted order. ~JsonDoc~ is JSON
+kept as the text it was written as: ~(json-doc "{...}")~.
 
 *A value reads back equal on every database.* Times are kept to the
 microsecond: ~to-sql~ truncates a finer part, because Postgres keeps

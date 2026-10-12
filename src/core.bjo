@@ -64,7 +64,7 @@
               instant->utc-datetime ->year ->month ->day ->hours ->minutes ->seconds ->nanoseconds
               duration))
 (import (only (std uuid) uuid->string string->uuid bytes->uuid))
-(import (only (text json) parse-json))
+(import (only (text json) parse-json json->string))
 
 (import/class
   (ArgumentException (: System.ArgumentException (-> string ArgumentException))))
@@ -360,8 +360,10 @@
       ((SqlText s) (Ok (json-doc s)))
       (_ (expected "JSON" v)))))
 
-;; A JSON column read as `(text json)`'s tree. There is no `ToSql Json`,
-;; because `(text json)` has no writer yet: write a `JsonDoc`.
+;; A JSON column as `(text json)`'s tree. The text is compact, with the keys
+;; of an object in sorted order. A `JsonDoc` keeps the text as it was written.
+(impl (ToSql Json) (defun (to-sql j) (SqlJson (json->string j))))
+
 (impl (FromSql Json)
   (defun (from-sql v)
     (def text
@@ -1045,6 +1047,7 @@
     ((= written "decimal") (Some (sym "DecimalType")))
     ((= written "Uuid") (Some (sym "UuidType")))
     ((= written "JsonDoc") (Some (sym "JsonType")))
+    ((= written "Json") (Some (sym "JsonType")))
     (else None)))
 
 (: parse-options (-> Syntax (List Syntax) (Tuple bool bool (Option string))))
