@@ -31,7 +31,7 @@ Type Error at app.bjo:9: `idd` is not a tag of the union app/UserColumn [...]. I
 
 This package talks to no database. It turns a statement into text and
 parameters, and a driver runs that. [[file:../bjosqlite][bjosqlite]] is the
-driver for SQLite. A driver for another database needs only a ~Dialect~ and the
+driver for SQLite, and [[file:../bjopg][bjopg]] the driver for PostgreSQL. A driver for another database needs only a ~Dialect~ and the
 code that runs a ~Statement~, so the grammar, the tables and the type checking
 are the same for every database.
 
@@ -55,10 +55,46 @@ declares:
 | ~UserCond~   | ~(Cond UserTest)~, for a condition built on its own           |
 | ~users~      | the ~Table~ value you pass to a driver                        |
 
-The column types are ~int~ and ~long~ (stored as integers), ~double~, ~string~,
-~bool~ and ~(Array byte)~, and ~(Option T)~ of any of them for a nullable
-column. For any other type, use ~#:sql-type "TIMESTAMP"~ and give the type
-~ToSql~ and ~FromSql~ implementations.
+The column types, and ~(Option T)~ of any of them for a nullable column:
+
+| Bjolang type   | Postgres (standard SQL)    | SQLite                                 |
+|----------------+----------------------------+----------------------------------------|
+| ~int~          | ~INTEGER~                  | ~INTEGER~                              |
+| ~long~         | ~BIGINT~                   | ~INTEGER~                              |
+| ~double~       | ~DOUBLE PRECISION~         | ~REAL~                                 |
+| ~string~       | ~TEXT~                     | ~TEXT~                                 |
+| ~bool~         | ~BOOLEAN~                  | ~BOOLEAN~, 0 or 1                      |
+| ~(Array byte)~ | ~BYTEA~ (~BLOB~)           | ~BLOB~                                 |
+| ~Date~         | ~DATE~                     | ~TEXT~: ~2026-10-12~                    |
+| ~Time~         | ~TIME~                     | ~TEXT~: ~14:05:09.000000~               |
+| ~DateTime~     | ~TIMESTAMP~                | ~TEXT~: ~2026-10-12 14:05:09.000000~    |
+| ~Instant~      | ~TIMESTAMP WITH TIME ZONE~ | ~TEXT~: ~2026-10-12 12:05:09.000000Z~   |
+| ~decimal~      | ~NUMERIC~                  | ~TEXT~: ~-12.50~                        |
+| ~Uuid~         | ~UUID~                     | ~TEXT~: lower case, with hyphens       |
+| ~JsonDoc~      | ~JSONB~ (~JSON~)           | ~TEXT~                                 |
+
+~Date~, ~Time~, ~DateTime~ and ~Instant~ are ~(std datetime)~'s, and ~Uuid~ is
+~(std uuid)~'s. ~JsonDoc~ is the text of a JSON value: ~(json-doc "{...}")~. A
+JSON column also reads as ~(text json)~'s ~Json~ with ~row-field~.
+
+*A value reads back equal on every database.* Times are kept to the
+microsecond: ~to-sql~ truncates a finer part, because Postgres keeps
+microseconds.
+
+*SQLite stores the types it does not have as text of a fixed width*, with six
+digits of fraction and an instant always in UTC. SQLite compares text character
+by character, so a fixed width is what makes ~ORDER BY~ and ~<~ give the order
+of the values. The columns are declared ~TEXT~, because ~DATE~ or ~DECIMAL~
+would make SQLite store ~12.50~ as the real 12.5. SQLite's own date and time
+functions read the text.
+
+*A decimal in SQLite is exact, but SQL compares it as text*: ~"10.0" < "9.0"~,
+and ~SUM~ adds it as reals. Compare and add decimals in Bjolang, or use a
+database that has the type.
+
+For any other type, use ~#:sql-type "INET"~ and give the type ~ToSql~ and
+~FromSql~ implementations. ~ToSql~ answers ~(SqlOther "inet" text)~, which a
+driver sends with a cast to the type where the database needs one.
 
 The column options are ~#:primary-key~ (on several columns, it makes a composite
 key), ~#:auto~ (the database assigns the value, so the column is left out of an
@@ -141,9 +177,17 @@ from data.
 ** Values and rows
 
 ~SqlValue~ is what a database stores: ~SqlNull~, ~(SqlInt long)~, ~(SqlReal
-double)~, ~(SqlText string)~, ~(SqlBlob (Array byte))~, ~(SqlBool bool)~.
-~ToSql~ turns a Bjolang value into one, and ~FromSql~ reads one back. When the
-value does not fit, ~FromSql~ says what arrived.
+double)~, ~(SqlText string)~, ~(SqlBlob (Array byte))~, ~(SqlBool bool)~,
+~(SqlDate Date)~, ~(SqlTime Time)~, ~(SqlTimestamp DateTime)~, ~(SqlInstant
+Instant)~, ~(SqlDecimal decimal)~, ~(SqlUuid Uuid)~, ~(SqlJson string)~, and
+~(SqlOther type-name text)~ for anything else. ~ToSql~ turns a Bjolang value
+into one, and ~FromSql~ reads one back. When the value does not fit,
+~FromSql~ says what arrived.
+
+A ~FromSql~ accepts its own case and the text that ~stored-text~ writes for it,
+so a value reads back from a database that stored it as text. A type of your
+own is written in terms of these: a ~Money~ whose ~ToSql~ answers a
+~SqlDecimal~ works on every driver.
 
 A driver returns ~Row~ values, which hold the result's column names and values.
 ~(row-field row "n")~ reads one column as whatever type the use site asks for.
@@ -166,7 +210,14 @@ column.
 ~select->sql~, ~change->sql~, ~insert->sql~ and ~create-table->sql~ produce a
 ~Sql~ value. ~render~ turns it into a ~Statement~ using the dialect: the
 placeholders, name quoting, column type names, what an auto-numbered key is
-called, and the ~LIMIT~ that an ~OFFSET~ without one needs. An insert ends in
+called, the ~LIMIT~ that an ~OFFSET~ without one needs, and the cast after a
+placeholder. ~postgres-style-cast~ writes ~::inet~ for a ~(SqlOther "inet" _)~.
+
+*A driver handles every case of ~SqlValue~ and ~ColumnType~*, and names each
+one in its ~match~, with no ~_~. A case that a new version of bjosql adds is
+then a compile error in the driver, not a value it binds by guessing. For a
+type its database does not have, a driver binds the text that ~stored-text~
+gives and declares the column ~TEXT~, as bjosqlite does. An insert ends in
 ~RETURNING~ with every column, so the driver can return the stored row. This
 works in SQLite 3.35 and later, PostgreSQL and MariaDB, but not MySQL.
 
