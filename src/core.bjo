@@ -60,11 +60,11 @@
 (import (std prelude))
 (import (std syntax-match))
 (import (only (std datetime)
-              iso8601->date iso8601->time iso8601->datetime iso8601->instant
+              Duration Instant DateTime Time Date iso8601->date iso8601->time iso8601->datetime iso8601->instant
               instant->utc-datetime ->year ->month ->day ->hours ->minutes ->seconds ->nanoseconds
               duration))
-(import (only (std uuid) uuid->string string->uuid bytes->uuid))
-(import (only (text json) parse-json json->string))
+(import (only (std uuid) Uuid uuid->string string->uuid bytes->uuid))
+(import (only (text json) Json parse-json json->string))
 
 (import/class
   (ArgumentException (: System.ArgumentException (-> string ArgumentException))))
