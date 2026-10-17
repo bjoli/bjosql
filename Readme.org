@@ -20,13 +20,13 @@ checker reads against the table's columns:
            (limit 10)))
 #+END_SRC
 
-~(name (= ,3))~ is a type error, because ~name~ is a string. ~(id is-null)~ is
-one too, because ~id~ is not an ~Option~. A misspelt column is reported with the
-columns that exist:
+The query language is a set of grammars (~def/grammar~). The type checker reads
+the literal against them where the literal is written. ~(name (= ,3))~ is a type
+error, because ~name~ is a string. ~(id is-null)~ is one too, because ~id~ is not
+an ~Option~. A misspelt column is an error at the literal:
 
 #+BEGIN_SRC
-Type Error at app.bjo:9: `idd` is not a tag of the union app/UserColumn [...]. Its tags are id, name, email or age.
-  note: `idd` is not a tag of core/Clause either, so this list was read as core/Columns. The tags of core/Clause are *, distinct, where, order-by, limit or offset.
+Type Error at app.bjo:9: Clause: expected UserColumn or the end of the list; found the symbol `idd`.
 #+END_SRC
 
 This package talks to no database. It turns a statement into text and
@@ -47,9 +47,9 @@ are the same for every database.
 declares:
 
 | ~User~       | the row record, with one field for each column               |
-| ~UserColumn~ | the column names: ~id~, ~name~, ~email~                       |
-| ~UserTest~   | the tests on each column: ~(Test int)~, ~(NTest string)~ and so on |
-| ~UserSet~    | the values each column can be set to                          |
+| ~UserColumn~ | a grammar of the column names: ~id~, ~name~, ~email~          |
+| ~UserTest~   | a grammar of the tests on each column: ~(id (Test int))~, ~(email (NTest string))~ and so on |
+| ~UserSet~    | a grammar of the values each column can be set to             |
 | ~UserSelect~ | ~(Select UserColumn UserTest)~, the type of a query literal   |
 | ~UserChange~ | ~(Change UserSet UserTest)~, for updates and deletes          |
 | ~UserCond~   | ~(Cond UserTest)~, for a condition built on its own           |
@@ -102,6 +102,10 @@ The column options are ~#:primary-key~ (on several columns, it makes a composite
 key), ~#:auto~ (the database assigns the value, so the column is left out of an
 insert), and ~#:sql-type~. To give the table a different name in SQL, write
 ~#:sql-name "app_users"~ after the record's name.
+
+A column name is a keyword in a query. A column with the name ~and~, ~or~ or
+~not~ is allowed, but a condition on it is an error, because a condition uses
+these keywords too.
 
 The expansion refers to the grammar's types (~Test~, ~Table~, ~IntegerType~) by
 name, so the module that uses ~def/table~ must import ~(bjosql core)~ without a

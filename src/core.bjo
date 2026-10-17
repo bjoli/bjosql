@@ -224,9 +224,10 @@
 ;; What an update sets a nullable column to. A literal reads as one:
 ;; `(email "a@b.c")` is a value, `(email null)` is NULL, and `(email ,maybe)`
 ;; takes an `(Option string)` as it is.
-(type (: (Nullable %v) (Union (: NullValue #:tag null)
-                              (: Value %v)
-                              (: MaybeValue (Option %v)))))
+(def/grammar (Nullable %v)
+  (:or (: NullValue 'null)
+       (: Value %v)
+       (: MaybeValue ,(Option %v))))
 
 (impl (ToSql (Nullable %v))
   (where (ToSql %v))
@@ -645,64 +646,74 @@
 ;; The grammar
 ;; ---------------------------------------------------------------------------
 ;;
-;; Generic over a table's words: `%col` is its columns, `%test` the tests on
-;; them, `%set` the assignments to them. `def/table` declares those three for
-;; a table, and a literal at `(Select UserColumn UserTest)` is read against
-;; them.
+;; Grammars, generic over a table's words: `%col` is its columns, `%test` the
+;; tests on them, `%assign` the assignments to them. `def/table` declares a
+;; grammar for each of the three. A literal at `(Select UserColumn UserTest)`
+;; is read by `Select`, and a column keyword such as `(id ...)` is looked up
+;; in the table's grammar.
 
 ;; A comparison against a value of the column's type.
-(type (: (Test %v) (Union (: Eq %v #:tag =)
-                          (: Ne %v #:tag <>)
-                          (: Lt %v #:tag <)
-                          (: Le %v #:tag <=)
-                          (: Gt %v #:tag >)
-                          (: Ge %v #:tag >=)
-                          (: Between %v %v #:tag between)
-                          (: In (List %v) #:tag in #:rest)
-                          (: Like string #:tag like))))
+(def/grammar (Test %v)
+  (:or (: Eq ('= %v))
+       (: Ne ('<> %v))
+       (: Lt ('< %v))
+       (: Le ('<= %v))
+       (: Gt ('> %v))
+       (: Ge ('>= %v))
+       (: Between (between %v %v))
+       (: In (in %v ...))
+       (: Like (like string))))
 
-;; The tests on a nullable column: the null checks, and through the untagged
-;; `Is` every test of `Test` — `(email (= "x"))` is `(Is (Eq "x"))`.
-(type (: (NTest %v) (Union (: IsNull #:tag is-null)
-                           (: NotNull #:tag not-null)
-                           (: Is (Test %v)))))
+;; The tests on a nullable column: the null checks, and every test of `Test`
+;; through `Is`. `(email (= "x"))` is `(Is (Eq "x"))`.
+(def/grammar (NTest %v)
+  (:or (: IsNull 'is-null)
+       (: NotNull 'not-null)
+       (: Is (Test %v))))
 
-;; A condition over a table's tests. A tag that is not `and`, `or` or `not`
-;; is a column, found through `Leaf`. `RawCond` is SQL written by hand, spliced
-;; in with `,`: `(and (id (> 3)) ,(sql "length(name) > ?" (list (to-sql 2))))`.
-(type-rec
-  (: (Cond %test) (Union (: And (List (Cond %test)) #:tag and #:rest)
-                         (: Or (List (Cond %test)) #:tag or #:rest)
-                         (: Not (Cond %test) #:tag not)
-                         (: RawCond Sql)
-                         (: Leaf %test))))
+;; A condition over a table's tests. A list that does not start with `and`,
+;; `or` or `not` is a column test, read by `Leaf`. `RawCond` is SQL written by
+;; hand, spliced in with `,`: `(and (id (> 3)) ,(sql "length(name) > ?" (list (to-sql 2))))`.
+(def/grammar (Cond %test)
+  (:or (: And (and (Cond %test) ...))
+       (: Or (or (Cond %test) ...))
+       (: Not (not (Cond %test)))
+       (: RawCond ,Sql)
+       (: Leaf %test)))
 
 ;; `(asc name)`, `(desc id)`, or the column alone for ascending.
-(type (: (Order %col) (Union (: Asc %col #:tag asc)
-                             (: Desc %col #:tag desc)
-                             (: By %col))))
+(def/grammar (Order %col)
+  (:or (: Asc (asc %col))
+       (: Desc (desc %col))
+       (: By %col)))
 
 ;; The clauses of a select, in any order. The projection is the one clause
-;; with no tag: `(id name)`.
-(type (: (Clause %col %test) (Union (: Columns (List %col))
-                                    (: All #:tag *)
-                                    (: Distinct #:tag distinct)
-                                    (: Where (Cond %test) #:tag where)
-                                    (: OrderBy (List (Order %col)) #:tag order-by #:rest)
-                                    (: Limit int #:tag limit)
-                                    (: Offset int #:tag offset))))
+;; that is a list without a keyword: `(id name)`.
+(def/grammar (Clause %col %test)
+  (:or (: Columns (:list %col ...))
+       (: All '*)
+       (: Distinct 'distinct)
+       (: Where (where (Cond %test)))
+       (: OrderBy (order-by (Order %col) ...))
+       (: Limit (limit int))
+       (: Offset (offset int))))
 
-(type (: (Select %col %test) (Union (: SelectQuery (List (Clause %col %test)) #:tag select #:rest))))
+(def/grammar (Select %col %test)
+  (:or (: SelectQuery (select (Clause %col %test) ...))))
 
-(type (: (UpdateClause %set %test) (Union (: SetTo (List %set) #:tag set #:rest)
-                                          (: UpdateWhere (Cond %test) #:tag where))))
+;; The parameter is `%assign` and not `%set`: a keyword with the name of a
+;; parameter does not read in another module (a compiler bug).
+(def/grammar (UpdateClause %assign %test)
+  (:or (: SetTo (set %assign ...))
+       (: UpdateWhere (where (Cond %test)))))
 
-(type (: (DeleteClause %test) (Union (: DeleteWhere (Cond %test) #:tag where))))
+(def/grammar (DeleteClause %test)
+  (:or (: DeleteWhere (where (Cond %test)))))
 
 ;; What changes rows: `(update (set ...) (where ...))` or `(delete (where ...))`.
-(type (: (Change %set %test)
-         (Union (: UpdateQuery (List (UpdateClause %set %test)) #:tag update #:rest)
-                (: DeleteQuery (List (DeleteClause %test)) #:tag delete #:rest))))
+(def/grammar (Change %assign %test)
+  (:or (: UpdateQuery (update (UpdateClause %assign %test) ...))
+       (: DeleteQuery (delete (DeleteClause %test) ...))))
 
 
 ;; ---------------------------------------------------------------------------
@@ -987,11 +998,11 @@
 ;; declares
 ;;
 ;;     User         the row record, with a field per column
-;;     UserColumn   the column names:        (UserColumn/id #:tag id) ...
-;;     UserTest     the tests on each:       (UserTest/id (Test int) #:tag id) ...
-;;                                           (UserTest/email (NTest string) #:tag email)
-;;     UserSet      the assignments to each: (UserSet/id int #:tag id) ...
-;;                                           (UserSet/email (Nullable string) #:tag email)
+;;     UserColumn   a grammar of the column names:  (: UserColumn/id 'id) ...
+;;     UserTest     a grammar of the tests on each: (: UserTest/id ('id (Test int))) ...
+;;                                                  (: UserTest/email ('email (NTest string)))
+;;     UserSet      a grammar of the assignments:   (: UserSet/id ('id int)) ...
+;;                                                  (: UserSet/email ('email (Nullable string)))
 ;;     UserSelect   (Select UserColumn UserTest), what a query literal is read as
 ;;     UserChange   (Change UserSet UserTest), for updates and deletes
 ;;     UserCond     (Cond UserTest), for a condition built on its own
@@ -1001,6 +1012,10 @@
 ;; name in SQL. A column's options are `#:primary-key`, `#:auto` (numbered by
 ;; the database, and left out of an insert) and `#:sql-type "TEXT"` for a type
 ;; this library does not know, which then needs `ToSql` and `FromSql`.
+;;
+;; A column name is a keyword of the table's grammars. A column with the name
+;; `and`, `or` or `not` can be declared, but a condition on it is an error:
+;; `Cond` has the same keywords.
 ;;
 ;; The expansion names the grammar's types and constructors — `Test`,
 ;; `Table`, `IntegerType` — where it lands, so the module using it imports
@@ -1103,6 +1118,11 @@
 (defun (case-name inject union s)
   (inject (string->symbol (str union "/" (syntax-name (record-ref s field))))))
 
+;; The column's name as a grammar keyword, `'email`. Quoted, so that a column
+;; whose name is also a type, as `long`, is still a keyword.
+(: keyword (-> Spec Syntax))
+(defun (keyword s) (SDatum (string->symbol (syntax-name (record-ref s field)))))
+
 (: bool-syntax (-> bool Syntax))
 (defun (bool-syntax b) (if b (sym "#t") (sym "#f")))
 
@@ -1127,20 +1147,21 @@
           => out))
   #'(begin
       (type (: ,row (Record ,@(list-map (fun (s) #'(: ,(record-ref s field) ,(record-ref s type))) specs))))
-      (type (: ,col-type (Union ,@(list-map (fun (s) #'(: ,(case-name inject col-union s) #:tag ,(record-ref s field))) specs))))
-      (type (: ,test-type
-               (Union ,@(list-map (fun (s)
-                                    (def inner (record-ref s inner))
-                                    (def test (if (record-ref s nullable) #'(NTest ,inner) #'(Test ,inner)))
-                                    #'(: ,(case-name inject test-union s) ,test #:tag ,(record-ref s field)))
-                                  specs))))
-      (type (: ,set-type
-               (Union ,@(list-map (fun (s)
-                                    (def payload (if (record-ref s nullable)
-                                                     #'(Nullable ,(record-ref s inner))
-                                                     (record-ref s type)))
-                                    #'(: ,(case-name inject set-union s) ,payload #:tag ,(record-ref s field)))
-                                  specs))))
+      (def/grammar ,col-type
+        (:or ,@(list-map (fun (s) #'(: ,(case-name inject col-union s) ,(keyword s))) specs)))
+      (def/grammar ,test-type
+        (:or ,@(list-map (fun (s)
+                           (def inner (record-ref s inner))
+                           (def test (if (record-ref s nullable) #'(NTest ,inner) #'(Test ,inner)))
+                           #'(: ,(case-name inject test-union s) (,(keyword s) ,test)))
+                         specs)))
+      (def/grammar ,set-type
+        (:or ,@(list-map (fun (s)
+                           (def payload (if (record-ref s nullable)
+                                            #'(Nullable ,(record-ref s inner))
+                                            (record-ref s type)))
+                           #'(: ,(case-name inject set-union s) (,(keyword s) ,payload)))
+                         specs)))
       (type (: ,(declared "Select") (Select ,col-type ,test-type)))
       (type (: ,(declared "Change") (Change ,set-type ,test-type)))
       (type (: ,(declared "Cond") (Cond ,test-type)))
