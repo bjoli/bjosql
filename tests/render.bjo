@@ -210,7 +210,7 @@
                      [(SqlInt 7L) (SqlText "Ada") SqlNull (SqlInt 36L)]))
   (expect "a row is decoded by column name"
           (match (decode-row users row)
-            ((Ok u) (str (int->string (record-ref u id)) " " (record-ref u name) " " (->str (record-ref u email))))
+            ((Ok u) (str (int->string (record-ref u id)) " " (record-ref u name) " " (displayed (record-ref u email))))
             ((Err e) (sql-error-message e)))
           "7 Ada None")
   (expect "a missing column is named"
@@ -311,8 +311,8 @@
                                         (SqlText "14:05:09.000000") (SqlText "2026-10-12 14:05:09.000000")
                                         (SqlText "2026-10-12 12:00:00.000000Z") (SqlText "9.50")
                                         (SqlText "[]") (SqlInt 5L) SqlNull]))
-            ((Ok e) (str (->str (record-ref e key)) " " (decimal->string (record-ref e price))
-                         " " (->str (record-ref e happened))))
+            ((Ok e) (str (displayed (record-ref e key)) " " (decimal->string (record-ref e price))
+                         " " (displayed (record-ref e happened))))
             ((Err e) (sql-error-message e)))
           "6ba7b810-9dad-11d1-80b4-00c04fd430c8 9.50 2026-10-12T12:00:00Z")
 
